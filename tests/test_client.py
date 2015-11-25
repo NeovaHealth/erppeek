@@ -7,6 +7,7 @@ from ._common import XmlRpcTestCase, OBJ
 
 AUTH = sentinel.AUTH
 ID1, ID2 = 4001, 4002
+STABLE = ('uninstallable', 'uninstalled', 'installed')
 
 
 class IdentDict(object):
@@ -57,7 +58,7 @@ class TestService(XmlRpcTestCase):
         self.assertCalls(call('login', ('aaa',)), 'call().__str__')
         self.assertOutput('')
 
-    def test_service_openerp_client(self, server_version='6.1'):
+    def test_service_openerp_client(self, server_version='8.0'):
         server = 'http://127.0.0.1:8069'
         self.service.side_effect = [server_version, ['newdb'], 1]
         client = erppeek.Client(server, 'newdb', 'usr', 'pss')
@@ -67,26 +68,30 @@ class TestService(XmlRpcTestCase):
         self.assertIsInstance(client.common, erppeek.Service)
         self.assertIsInstance(client._object, erppeek.Service)
         self.assertIsInstance(client._report, erppeek.Service)
-        if server_version == '7.0':
+        if server_version >= '7.0':
             self.assertNotIsInstance(client._wizard, erppeek.Service)
         else:
             self.assertIsInstance(client._wizard, erppeek.Service)
 
-        self.assertIn('/xmlrpc/db', str(client.db.create))
-        if server_version == '5.0':
+        self.assertIn('/xmlrpc/db', str(client.db.create_database))
+        self.assertIn('/xmlrpc/db', str(client.db.db_exist))
+        if server_version == '8.0':
             self.assertRaises(AttributeError, getattr,
-                              client.db, 'create_database')
+                              client.db, 'create')
             self.assertRaises(AttributeError, getattr,
-                              client.db, 'db_exist')
+                              client.db, 'get_progress')
         else:
-            self.assertIn('/xmlrpc/db', str(client.db.create_database))
-            self.assertIn('/xmlrpc/db', str(client.db.db_exist))
+            self.assertIn('/xmlrpc/db', str(client.db.create))
+            self.assertIn('/xmlrpc/db', str(client.db.get_progress))
 
         self.assertCalls(ANY, ANY, ANY)
         self.assertOutput('')
 
     def test_service_openerp_50(self):
         self.test_service_openerp_client(server_version='5.0')
+
+    def test_service_openerp_61(self):
+        self.test_service_openerp_client(server_version='6.1')
 
     def test_service_openerp_70(self):
         self.test_service_openerp_client(server_version='7.0')
@@ -96,13 +101,13 @@ class TestCreateClient(XmlRpcTestCase):
     """Test the Client class."""
     server_version = '6.1'
     startup_calls = (
-        call(ANY, 'db', ANY, verbose=ANY),
+        call(ANY, 'db', ANY, None, verbose=ANY),
         'db.server_version',
-        call(ANY, 'db', ANY, verbose=ANY),
-        call(ANY, 'common', ANY, verbose=ANY),
-        call(ANY, 'object', ANY, verbose=ANY),
-        call(ANY, 'report', ANY, verbose=ANY),
-        call(ANY, 'wizard', ANY, verbose=ANY),
+        call(ANY, 'db', ANY, None, verbose=ANY),
+        call(ANY, 'common', ANY, None, verbose=ANY),
+        call(ANY, 'object', ANY, None, verbose=ANY),
+        call(ANY, 'report', ANY, None, verbose=ANY),
+        call(ANY, 'wizard', ANY, None, verbose=ANY),
         'db.list',
     )
 
@@ -183,6 +188,13 @@ class TestCreateClient(XmlRpcTestCase):
         self.assertEqual(read_config.call_count, 1)
         self.assertEqual(getpass.call_count, 1)
 
+    def test_create_invalid(self):
+        # Without mock
+        self.service.stop()
+
+        self.assertRaises(EnvironmentError, erppeek.Client, 'dsadas')
+        self.assertOutput('')
+
 
 class TestSampleSession(XmlRpcTestCase):
     server_version = '6.1'
@@ -228,7 +240,7 @@ class TestSampleSession(XmlRpcTestCase):
 
     def test_module_upgrade(self):
         self.service.object.execute.side_effect = [
-            (42, 0), [42], ANY, [42],
+            (42, 0), [42], [], ANY, [42],
             [{'id': 42, 'state': ANY, 'name': ANY}], ANY]
 
         result = self.client.upgrade('dummy')
@@ -238,9 +250,9 @@ class TestSampleSession(XmlRpcTestCase):
         self.assertCalls(
             imm + ('update_list',),
             imm + ('search', [('name', 'in', ('dummy',))]),
+            imm + ('search', [('state', 'not in', STABLE)]),
             imm + ('button_upgrade', [42]),
-            imm + ('search', [('state', 'not in',
-                              ('uninstallable', 'uninstalled', 'installed'))]),
+            imm + ('search', [('state', 'not in', STABLE)]),
             imm + ('read', [42], ['name', 'state']),
             bmu + ('upgrade_module', []),
         )
@@ -252,7 +264,7 @@ class TestSampleSession50(TestSampleSession):
 
     def test_module_upgrade(self):
         self.service.object.execute.side_effect = [
-            (42, 0), [42], ANY, [42],
+            (42, 0), [42], [], ANY, [42],
             [{'id': 42, 'state': ANY, 'name': ANY}]]
         self.service.wizard.create.return_value = 17
         self.service.wizard.execute.return_value = {'state': (['config'],)}
@@ -263,9 +275,9 @@ class TestSampleSession50(TestSampleSession):
         self.assertCalls(
             imm + ('update_list',),
             imm + ('search', [('name', 'in', ('dummy',))]),
+            imm + ('search', [('state', 'not in', STABLE)]),
             imm + ('button_upgrade', [42]),
-            imm + ('search', [('state', 'not in',
-                              ('uninstallable', 'uninstalled', 'installed'))]),
+            imm + ('search', [('state', 'not in', STABLE)]),
             imm + ('read', [42], ['name', 'state']),
             ('wizard.create', AUTH, 'module.upgrade'),
             ('wizard.execute', AUTH, 17, {}, 'start', None),
@@ -291,24 +303,18 @@ class TestClientApi(XmlRpcTestCase):
 
     def test_create_database(self):
         create_database = self.client.create_database
-        mock.patch('time.sleep').start()
-        self.client.db.create.return_value = ID1
-        self.client.db.get_progress.return_value = \
-            [1, [{'login': 'LL', 'password': 'PP'}]]
         self.client.db.list.side_effect = [['db1'], ['db2']]
 
         create_database('abc', 'db1')
         create_database('xyz', 'db2', user_password='secret', lang='fr_FR')
 
         self.assertCalls(
-            call.db.create('abc', 'db1', False, 'en_US', 'admin'),
-            call.db.get_progress('abc', ID1),
+            call.db.create_database('abc', 'db1', False, 'en_US', 'admin'),
             call.db.list(),
-            call.common.login('db1', 'LL', 'PP'),
-            call.db.create('xyz', 'db2', False, 'fr_FR', 'secret'),
-            call.db.get_progress('xyz', ID1),
+            call.common.login('db1', 'admin', 'admin'),
+            call.db.create_database('xyz', 'db2', False, 'fr_FR', 'secret'),
             call.db.list(),
-            call.common.login('db2', 'LL', 'PP'),
+            call.common.login('db2', 'admin', 'secret'),
         )
         self.assertOutput('')
 
@@ -699,26 +705,35 @@ class TestClientApi(XmlRpcTestCase):
         self.assertOutput('')
 
     def _module_upgrade(self, button='upgrade'):
-        self.service.object.execute.side_effect = [
-            [7, 0], [42], {'name': 'Upgrade'}, [4, 42, 5],
+        execute_return = [
+            [7, 0], [42], [], {'name': 'Upgrade'}, [4, 42, 5],
             [{'id': 4, 'state': ANY, 'name': ANY},
              {'id': 5, 'state': ANY, 'name': ANY},
              {'id': 42, 'state': ANY, 'name': ANY}], ANY]
         action = getattr(self.client, button)
 
-        result = action('dummy', 'spam')
-        self.assertIsNone(result)
         imm = ('object.execute', AUTH, 'ir.module.module')
         bmu = ('object.execute', AUTH, 'base.module.upgrade')
-        self.assertCalls(
+        expected_calls = [
             imm + ('update_list',),
             imm + ('search', [('name', 'in', ('dummy', 'spam'))]),
+            imm + ('search', [('state', 'not in', STABLE)]),
             imm + ('button_' + button, [42]),
-            imm + ('search', [('state', 'not in',
-                              ('uninstallable', 'uninstalled', 'installed'))]),
+            imm + ('search', [('state', 'not in', STABLE)]),
             imm + ('read', [4, 42, 5], ['name', 'state']),
             bmu + ('upgrade_module', []),
-        )
+        ]
+        if button == 'uninstall':
+            execute_return[3:3] = [[], ANY]
+            expected_calls[3:3] = [
+                imm + ('search', [('id', 'in', [42]), ('state', '!=', 'installed')]),
+                imm + ('write', [42], {'state': 'to remove'}),
+            ]
+
+        self.service.object.execute.side_effect = execute_return
+        result = action('dummy', 'spam')
+        self.assertIsNone(result)
+        self.assertCalls(*expected_calls)
 
         self.assertIn('to process', self.stdout.popvalue())
         self.assertOutput('')
@@ -738,9 +753,32 @@ class TestClientApi50(TestClientApi):
         pass
     test_execute_kw = test_render_report = _skip
 
+    def test_create_database(self):
+        create_database = self.client.create_database
+        mock.patch('time.sleep').start()
+        self.client.db.create.return_value = ID1
+        self.client.db.get_progress.return_value = \
+            [1, [{'login': 'admin', 'password': 'PP'}]]
+        self.client.db.list.side_effect = [['db1'], ['db2']]
+
+        create_database('abc', 'db1')
+        create_database('xyz', 'db2', user_password='secret', lang='fr_FR')
+
+        self.assertCalls(
+            call.db.create('abc', 'db1', False, 'en_US', 'admin'),
+            call.db.get_progress('abc', ID1),
+            call.db.list(),
+            call.common.login('db1', 'admin', 'admin'),
+            call.db.create('xyz', 'db2', False, 'fr_FR', 'secret'),
+            call.db.get_progress('xyz', ID1),
+            call.db.list(),
+            call.common.login('db2', 'admin', 'secret'),
+        )
+        self.assertOutput('')
+
     def _module_upgrade(self, button='upgrade'):
-        self.service.object.execute.side_effect = [
-            [7, 0], [42], {'name': 'Upgrade'}, [4, 42, 5],
+        execute_return = [
+            [7, 0], [42], [], {'name': 'Upgrade'}, [4, 42, 5],
             [{'id': 4, 'state': ANY, 'name': ANY},
              {'id': 5, 'state': ANY, 'name': ANY},
              {'id': 42, 'state': ANY, 'name': ANY}]]
@@ -748,19 +786,28 @@ class TestClientApi50(TestClientApi):
         self.service.wizard.execute.return_value = {'state': (['config'],)}
         action = getattr(self.client, button)
 
-        result = action('dummy', 'spam')
-        self.assertIsNone(result)
         imm = ('object.execute', AUTH, 'ir.module.module')
-        self.assertCalls(
+        expected_calls = [
             imm + ('update_list',),
             imm + ('search', [('name', 'in', ('dummy', 'spam'))]),
+            imm + ('search', [('state', 'not in', STABLE)]),
             imm + ('button_' + button, [42]),
-            imm + ('search', [('state', 'not in',
-                              ('uninstallable', 'uninstalled', 'installed'))]),
+            imm + ('search', [('state', 'not in', STABLE)]),
             imm + ('read', [4, 42, 5], ['name', 'state']),
             ('wizard.create', AUTH, 'module.upgrade'),
             ('wizard.execute', AUTH, 17, {}, 'start', None),
-        )
+        ]
+        if button == 'uninstall':
+            execute_return[3:3] = [[], ANY]
+            expected_calls[3:3] = [
+                imm + ('search', [('id', 'in', [42]), ('state', '!=', 'installed')]),
+                imm + ('write', [42], {'state': 'to remove'}),
+            ]
+
+        self.service.object.execute.side_effect = execute_return
+        result = action('dummy', 'spam')
+        self.assertIsNone(result)
+        self.assertCalls(*expected_calls)
 
         self.assertIn('to process', self.stdout.popvalue())
         self.assertOutput('')

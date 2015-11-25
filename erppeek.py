@@ -22,30 +22,15 @@ try:                    # Python 3
     import configparser
     from threading import current_thread
     from xmlrpc.client import Fault, ServerProxy
-    basestring = str
-    int_types = int
-    _DictWriter = csv.DictWriter
+    PY2 = False
 except ImportError:     # Python 2
     import ConfigParser as configparser
     from threading import currentThread as current_thread
     from xmlrpclib import Fault, ServerProxy
-    int_types = int, long
-
-    class _DictWriter(csv.DictWriter):
-        """Unicode CSV Writer, which encodes output to UTF-8."""
-
-        def writeheader(self):
-            # Method 'writeheader' does not exist in Python 2.6
-            header = dict(zip(self.fieldnames, self.fieldnames))
-            self.writerow(header)
-
-        def _dict_to_list(self, rowdict):
-            rowlst = csv.DictWriter._dict_to_list(self, rowdict)
-            return [cell.encode('utf-8') if hasattr(cell, 'encode') else cell
-                    for cell in rowlst]
+    PY2 = True
 
 
-__version__ = '1.6b1'
+__version__ = '1.6.2'
 __all__ = ['Client', 'Model', 'Record', 'RecordList', 'Service',
            'format_exception', 'read_config', 'start_odoo_services']
 
@@ -90,26 +75,59 @@ _fields_re = re.compile(r'(?:[^%]|^)%\(([^)]+)\)')
 
 # Published object methods
 _methods = {
-    'db': ['create', 'drop', 'dump', 'restore', 'rename',
-           'get_progress', 'list', 'list_lang',
+    'db': ['create_database', 'duplicate_database', 'db_exist',
+           'drop', 'dump', 'restore', 'rename', 'list', 'list_lang',
            'change_admin_password', 'server_version', 'migrate_databases'],
-    'common': ['about', 'login', 'timezone_get', 'get_server_environment',
-               'login_message', 'check_connectivity'],
-    'object': ['execute', 'exec_workflow'],
-    'report': ['report', 'report_get'],
-    'wizard': ['execute', 'create'],
+    'common': ['about', 'login', 'timezone_get',
+               'authenticate', 'version', 'set_loglevel'],
+    'object': ['execute', 'execute_kw', 'exec_workflow'],
+    'report': ['render_report', 'report', 'report_get'],
 }
-_methods_6_1 = {
-    'db': ['create_database', 'db_exist'],
-    'common': ['get_stats', 'list_http_services', 'version',
-               'authenticate', 'get_os_time', 'get_sqlcount'],
-    'object': ['execute_kw'],
-    'report': ['render_report'],
+# New 6.1: (db) create_database db_exist,
+#          (common) authenticate version set_loglevel
+#          (object) execute_kw,  (report) render_report
+# New 7.0: (db) duplicate_database
+
+_obsolete_methods = {
+    'db': ['create', 'get_progress'],                   # < 8.0
+    'common': ['check_connectivity', 'get_available_updates', 'get_os_time',
+               'get_migration_scripts', 'get_server_environment',
+               'get_sqlcount', 'get_stats',
+               'list_http_services', 'login_message'],  # < 8.0
+    'wizard': ['execute', 'create'],                    # < 7.0
 }
-# Hidden methods:
-#  - common: get_available_updates, get_migration_scripts, set_loglevel
 _cause_message = ("\nThe above exception was the direct cause "
                   "of the following exception:\n\n")
+
+if PY2:
+    int_types = int, long
+
+    class _DictWriter(csv.DictWriter):
+        """Unicode CSV Writer, which encodes output to UTF-8."""
+
+        def writeheader(self):
+            # Method 'writeheader' does not exist in Python 2.6
+            header = dict(zip(self.fieldnames, self.fieldnames))
+            self.writerow(header)
+
+        def _dict_to_list(self, rowdict):
+            rowlst = csv.DictWriter._dict_to_list(self, rowdict)
+            return [cell.encode('utf-8') if hasattr(cell, 'encode') else cell
+                    for cell in rowlst]
+else:   # Python 3
+    basestring = str
+    int_types = int
+    _DictWriter = csv.DictWriter
+
+
+def _memoize(inst, attr, value, doc_values=None):
+    if hasattr(value, '__get__') and not hasattr(value, '__self__'):
+        value.__name__ = attr
+        if doc_values is not None:
+            value.__doc__ %= doc_values
+        value = value.__get__(inst, type(inst))
+    inst.__dict__[attr] = value
+    return value
 
 
 # Simplified ast.literal_eval which does not parse operators
@@ -132,8 +150,10 @@ def _convert(node, _consts={'None': None, 'True': True, 'False': False}):
     raise ValueError('malformed or disallowed expression')
 
 
-def literal_eval(expression):
+def literal_eval(expression, _octal_digits=frozenset('01234567')):
     node = compile(expression, '<unknown>', 'eval', _ast.PyCF_ONLY_AST)
+    if expression[:1] == '0' and expression[1:2] in _octal_digits:
+        raise SyntaxError('unsupported octal notation')
     return _convert(node.body)
 
 
@@ -238,9 +258,9 @@ def start_odoo_services(options=None, appname=None):
     import openerp as odoo
     odoo._api_v7 = odoo.release.version_info < (8,)
     if not (odoo._api_v7 and odoo.osv.osv.service):
-        os.environ['TZ'] = 'UTC'
+        os.putenv('TZ', 'UTC')
         if appname is not None:
-            os.environ['PGAPPNAME'] = appname
+            os.putenv('PGAPPNAME', appname)
         odoo.tools.config.parse_config(options or [])
         if odoo.release.version_info < (7,):
             odoo.netsvc.init_logger()
@@ -250,12 +270,13 @@ def start_odoo_services(options=None, appname=None):
             odoo.service.start_internal()
         else:   # Odoo v8
             try:
-                odoo.Environment._local.environments = odoo.osv.env.WeakSet()
+                odoo.api.Environment._local.environments = \
+                    odoo.api.Environments()
             except AttributeError:
                 pass
 
         def close_all():
-            for db in odoo.modules.registry.RegistryManager.registries:
+            for db in odoo.modules.registry.RegistryManager.registries.keys():
                 odoo.sql_db.close_db(db)
         atexit.register(close_all)
 
@@ -323,14 +344,17 @@ class Service(object):
     instance to list them.
     """
     _rpcpath = ''
+    _methods = ()
 
-    def __init__(self, server, endpoint, methods, verbose=False):
+    def __init__(self, server, endpoint, methods,
+                 transport=None, verbose=False):
         if isinstance(server, basestring):
             self._rpcpath = rpcpath = server + '/xmlrpc/'
-            proxy = ServerProxy(rpcpath + endpoint, allow_none=True)
-            self._dispatch = proxy._ServerProxy__request
+            proxy = ServerProxy(rpcpath + endpoint,
+                                transport=transport, allow_none=True)
             if hasattr(proxy._ServerProxy__transport, 'close'):   # >= 2.7
                 self.close = proxy._ServerProxy__transport.close
+            self._dispatch = proxy._ServerProxy__request
         elif server._api_v7:
             proxy = server.netsvc.ExportService.getService(endpoint)
             self._dispatch = proxy.dispatch
@@ -375,8 +399,7 @@ class Service(object):
                 return res
         else:
             wrapper = lambda s, *args: s._dispatch(name, args)
-        wrapper.__name__ = name
-        return wrapper.__get__(self, type(self))
+        return _memoize(self, name, wrapper)
 
     def __del__(self):
         if hasattr(self, 'close'):
@@ -398,46 +421,49 @@ class Client(object):
     _config_file = os.path.join(os.curdir, CONF_FILE)
 
     def __init__(self, server, db=None, user=None, password=None,
-                 verbose=False):
+                 transport=None, verbose=False):
         if isinstance(server, basestring) and server[-1:] == '/':
             server = server.rstrip('/')
         elif isinstance(server, list):
             appname = os.path.basename(__file__).rstrip('co')
             server = start_odoo_services(server, appname=appname)
         self._server = server
-        major_version = None
+        float_version = 999
 
         def get_proxy(name):
-            if major_version in ('5.0', None) or name == 'wizard':
-                methods = _methods[name]
-            else:
-                # Only for Odoo and OpenERP >= 6
-                methods = _methods[name] + _methods_6_1[name]
-            return Service(server, name, methods, verbose=verbose)
+            methods = list(_methods[name]) if (name in _methods) else []
+            if float_version < 8.0:
+                methods += _obsolete_methods.get(name) or ()
+            return Service(server, name, methods, transport, verbose=verbose)
         self.server_version = ver = get_proxy('db').server_version()
-        self.major_version = major_version = '.'.join(ver.split('.', 2)[:2])
+        self.major_version = re.match('\d+\.?\d*', ver).group()
+        float_version = float(self.major_version)
         # Create the XML-RPC proxies
         self.db = get_proxy('db')
         self.common = get_proxy('common')
         self._object = get_proxy('object')
         self._report = get_proxy('report')
-        self._wizard = get_proxy('wizard') if major_version < '7.0' else None
+        self._wizard = get_proxy('wizard') if float_version < 7.0 else None
         self.reset()
+        self.context = None
         if db:
             # Try to login
             self.login(user, password=password, database=db)
 
     @classmethod
-    def from_config(cls, environment, verbose=False):
+    def from_config(cls, environment, user=None, verbose=False):
         """Create a connection to a defined environment.
 
         Read the settings from the section ``[environment]`` in the
         ``erppeek.ini`` file and return a connected :class:`Client`.
         See :func:`read_config` for details of the configuration file format.
         """
-        (server, db, user, password) = read_config(environment)
-        client = cls(server, db, user, password, verbose=verbose)
+        (server, db, conf_user, password) = read_config(environment)
+        if user and user != conf_user:
+            password = None
+        client = cls(server, verbose=verbose)
         client._environment = environment
+        client.login(user or conf_user, password=password, database=db)
         return client
 
     def reset(self):
@@ -454,20 +480,25 @@ class Client(object):
         If the `password` is not available, it will be asked.
         """
         if database:
-            dbs = self.db.list()
-            if database not in dbs:
-                raise Error("Database '%s' does not exist: %s" %
-                            (database, dbs))
+            try:
+                dbs = self.db.list()
+            except Fault:
+                pass    # AccessDenied: simply ignore this check
+            else:
+                if database not in dbs:
+                    raise Error("Database '%s' does not exist: %s" %
+                                (database, dbs))
+            if not self._db:
+                self._db = database
+            # Used for logging, copied from openerp.sql_db.db_connect
+            current_thread().dbname = database
         elif self._db:
             database = self._db
         else:
             raise Error('Not connected')
-        # Used for logging, copied from openerp.sql_db.db_connect
-        current_thread().dbname = database
         (uid, password) = self._auth(database, user, password)
         if not uid:
-            if not self._db:
-                self._db = database
+            current_thread().dbname = self._db
             raise Error('Invalid username or password')
         if self._db != database:
             self.reset()
@@ -568,6 +599,10 @@ class Client(object):
                 return
             client = self
             env = client._environment or client._db
+            try:  # copy the context to the new client
+                client.context = dict(global_vars['client'].context)
+            except (KeyError, TypeError):
+                pass  # client not yet in globals(), or context is None
             global_vars['client'] = client
             if hasattr(client._server, 'modules'):
                 global_vars['get_pool'] = get_pool
@@ -607,18 +642,20 @@ class Client(object):
         By default, `demo` data are not loaded and `lang` is ``en_US``.
         Wait for the thread to finish and login if successful.
         """
-        thread_id = self.db.create(passwd, database, demo, lang, user_password)
-        progress = 0
-        try:
-            while progress < 1:
-                time.sleep(3)
-                progress, users = self.db.get_progress(passwd, thread_id)
-            # [1.0, [{'login': 'admin', 'password': 'admin',
-            #         'name': 'Administrator'}]]
-            self.login(users[0]['login'], users[0]['password'],
-                       database=database)
-        except KeyboardInterrupt:
-            print({'id': thread_id, 'progress': progress})
+        if self.major_version in ('5.0', '6.0'):
+            thread_id = self.db.create(passwd, database, demo, lang,
+                                       user_password)
+            progress = 0
+            try:
+                while progress < 1:
+                    time.sleep(3)
+                    progress, users = self.db.get_progress(passwd, thread_id)
+            except KeyboardInterrupt:
+                return {'id': thread_id, 'progress': progress}
+        else:
+            self.db.create_database(passwd, database, demo, lang,
+                                    user_password)
+        return self.login('admin', user_password, database=database)
 
     def execute(self, obj, method, *params, **kwargs):
         """Wrapper around ``object.execute`` RPC method.
@@ -633,7 +670,7 @@ class Client(object):
         assert isinstance(method, basestring) and method != 'browse'
         context = kwargs.pop('context', None)
         ordered = single_id = False
-        if method in ('read', 'name_get'):
+        if method == 'read':
             assert params
             if issearchdomain(params[0]):
                 # Combine search+read
@@ -654,10 +691,8 @@ class Client(object):
                 return ids
             if len(params) > 1:
                 params = (ids,) + params[1:]
-            elif method == 'read':
-                params = (ids, kwargs.pop('fields', None))
             else:
-                params = (ids,)
+                params = (ids, kwargs.pop('fields', None))
         elif method == 'search':
             # Accept keyword arguments for the search method
             params = searchargs(params, kwargs, context)
@@ -714,21 +749,40 @@ class Client(object):
             if action == 'init' and name != wiz_id:
                 return wiz_id
             datas = {}
+        if context is None:
+            context = self.context
         return self._wizard_execute(wiz_id, datas, action, context)
 
     def _upgrade(self, modules, button):
         # First, update the list of modules
-        updated, added = self.execute('ir.module.module', 'update_list')
+        ir_module = self.model('ir.module.module', False)
+        updated, added = ir_module.update_list()
         if added:
             print('%s module(s) added to the list' % added)
         # Find modules
-        ids = modules and self.search('ir.module.module',
-                                      [('name', 'in', modules)])
+        ids = modules and ir_module.search([('name', 'in', modules)])
         if ids:
-            # Click upgrade/install/uninstall button
-            self.execute('ir.module.module', button, ids)
-        mods = self.read('ir.module.module',
-                         [('state', 'not in', STABLE_STATES)], 'name state')
+            # Safety check
+            mods = ir_module.read([('state', 'not in', STABLE_STATES)], 'name state')
+            if mods:
+                raise Error('Pending actions:\n' + '\n'.join(
+                    ('  %(state)s\t%(name)s' % mod) for mod in mods))
+            if button == 'button_uninstall':
+                # Safety check
+                names = ir_module.read([('id', 'in', ids),
+                                        'state != installed'], 'name')
+                if names:
+                    raise Error('Not installed: %s' % ', '.join(names))
+                # A trick to uninstall dependent add-ons
+                ir_module.write(ids, {'state': 'to remove'})
+            try:
+                # Click upgrade/install/uninstall button
+                self.execute('ir.module.module', button, ids)
+            except Exception:
+                if button == 'button_uninstall':
+                    ir_module.write(ids, {'state': 'installed'})
+                raise
+        mods = ir_module.read([('state', 'not in', STABLE_STATES)], 'name state')
         if not mods:
             if ids:
                 print('Already up-to-date: %s' %
@@ -921,9 +975,7 @@ class Client(object):
 
     def __getattr__(self, method):
         if not method.islower():
-            rv = self.model(lowercase(method))
-            self.__dict__[method] = rv
-            return rv
+            return _memoize(self, method, self.model(lowercase(method)))
         if method.startswith('_'):
             errmsg = "'Client' object has no attribute %r" % method
             raise AttributeError(errmsg)
@@ -932,9 +984,7 @@ class Client(object):
         def wrapper(self, obj, *params, **kwargs):
             """Wrapper for client.execute(obj, %r, *params, **kwargs)."""
             return self.execute(obj, method, *params, **kwargs)
-        wrapper.__name__ = method
-        wrapper.__doc__ %= method
-        return wrapper.__get__(self, type(self))
+        return _memoize(self, method, wrapper, method)
 
     def __enter__(self):
         return self
@@ -1010,7 +1060,7 @@ class Model(object):
         Be careful when passing a list of ids, because an empty list will be
         considered an empty domain and will find all records in the database.
         """
-        context = kwargs.pop('context', None)
+        context = kwargs.pop('context', self.client.context)
         if isinstance(domain, int_types):
             assert not params and not kwargs
             return Record(self, domain, context=context)
@@ -1032,6 +1082,8 @@ class Model(object):
         :class:`Record` or None.  If multiple records are found,
         a ``ValueError`` is raised.
         """
+        if context is None:
+            context = self.client.context
         if isinstance(domain, int_types):   # a single id
             return Record(self, domain, context=context)
         if isinstance(domain, basestring):  # lookup the xml_id
@@ -1059,6 +1111,8 @@ class Model(object):
 
         The newly created :class:`Record` is returned.
         """
+        if context is None:
+            context = self.client.context
         values = self._unbrowse_values(values)
         new_id = self._execute('create', values, context=context)
         return Record(self, new_id, context=context)
@@ -1086,7 +1140,7 @@ class Model(object):
             elif value and field_type == 'reference':
                 (res_model, res_id) = value.split(',')
                 rel_model = self.client.model(res_model, False)
-                values[key] = Record(rel_model, int(res_id))
+                values[key] = Record(rel_model, int(res_id), context=context)
         return values
 
     def _unbrowse_values(self, values):
@@ -1123,22 +1177,19 @@ class Model(object):
 
     def __getattr__(self, attr):
         if attr in ('_keys', '_fields'):
-            self.__dict__[attr] = rv = getattr(self, '_get' + attr)()
-            return rv
+            return _memoize(self, attr, getattr(self, '_get' + attr)())
         if attr.startswith('_imd_'):
             imd = self.client.model('ir.model.data')
-            self.__dict__[attr] = imd_method = getattr(imd, attr[5:])
-            return imd_method
+            return _memoize(self, attr, getattr(imd, attr[5:]))
         if attr.startswith('_'):
             raise AttributeError("'Model' object has no attribute %r" % attr)
 
         def wrapper(self, *params, **kwargs):
             """Wrapper for client.execute(%r, %r, *params, **kwargs)."""
+            if 'context' not in kwargs:
+                kwargs['context'] = self.client.context
             return self._execute(attr, *params, **kwargs)
-        wrapper.__name__ = attr
-        wrapper.__doc__ %= (self._name, attr)
-        self.__dict__[attr] = mobj = wrapper.__get__(self, type(self))
-        return mobj
+        return _memoize(self, attr, wrapper, (self._name, attr))
 
 
 class RecordList(object):
@@ -1158,6 +1209,8 @@ class RecordList(object):
             if isinstance(id_, (list, tuple)):
                 ids[index] = id_ = id_[0]
             assert isinstance(id_, int_types), repr(id_)
+        if context is None:
+            context = res_model.client.context
         # Bypass the __setattr__ method
         self.__dict__.update({
             'id': ids,
@@ -1190,7 +1243,7 @@ class RecordList(object):
 
     def read(self, fields=None, context=None):
         """Wrapper for :meth:`Record.read` method."""
-        if context is None and self._context:
+        if context is None:
             context = self._context
 
         client = self._model.client
@@ -1199,7 +1252,7 @@ class RecordList(object):
                                  fields, order=True, context=context)
             if is_list_of_dict(values):
                 browse_values = self._model._browse_values
-                return [v and browse_values(v) for v in values]
+                return [v and browse_values(v, context) for v in values]
         else:
             values = []
 
@@ -1211,14 +1264,14 @@ class RecordList(object):
                     return RecordList(rel_model, values, context=context)
                 if field['type'] in ('one2many', 'many2many'):
                     rel_model = client.model(field['relation'], False)
-                    return [RecordList(rel_model, v) for v in values]
+                    return [RecordList(rel_model, v, context) for v in values]
                 if field['type'] == 'reference':
                     records = []
                     for value in values:
                         if value:
                             (res_model, res_id) = value.split(',')
                             rel_model = client.model(res_model, False)
-                            value = Record(rel_model, int(res_id))
+                            value = Record(rel_model, int(res_id), context)
                         records.append(value)
                     return records
         return values
@@ -1227,7 +1280,7 @@ class RecordList(object):
         """Wrapper for :meth:`Record.write` method."""
         if not self.id:
             return True
-        if context is None and self._context:
+        if context is None:
             context = self._context
         values = self._model._unbrowse_values(values)
         rv = self._execute('write', self.id, values, context=context)
@@ -1237,7 +1290,7 @@ class RecordList(object):
         """Wrapper for :meth:`Record.unlink` method."""
         if not self.id:
             return True
-        if context is None and self._context:
+        if context is None:
             context = self._context
         rv = self._execute('unlink', self.id, context=context)
         return rv
@@ -1271,13 +1324,10 @@ class RecordList(object):
 
         def wrapper(self, *params, **kwargs):
             """Wrapper for client.execute(%r, %r, [...], *params, **kwargs)."""
-            if context:
-                kwargs.setdefault('context', context)
+            if context is not None and 'context' not in kwargs:
+                kwargs['context'] = context
             return self._execute(attr, self.id, *params, **kwargs)
-        wrapper.__name__ = attr
-        wrapper.__doc__ %= (self._model_name, attr)
-        self.__dict__[attr] = mobj = wrapper.__get__(self, type(self))
-        return mobj
+        return _memoize(self, attr, wrapper, (self._model_name, attr))
 
     def __setattr__(self, attr, value):
         if attr in self._model._keys or attr == 'id':
@@ -1285,6 +1335,10 @@ class RecordList(object):
         else:
             msg = "has no attribute %r"
         raise AttributeError("'RecordList' object %s" % msg % attr)
+
+    def __eq__(self, other):
+        return (isinstance(other, RecordList) and
+                self.id == other.id and self._model is other._model)
 
 
 class Record(object):
@@ -1304,6 +1358,8 @@ class Record(object):
             (res_id, res_name) = res_id
             self.__dict__['_name'] = res_name
         assert isinstance(res_id, int_types), repr(res_id)
+        if context is None:
+            context = res_model.client.context
         # Bypass the __setattr__ method
         self.__dict__.update({
             'id': res_id,
@@ -1320,14 +1376,19 @@ class Record(object):
     def __str__(self):
         return self._name
 
+    if PY2:
+        __unicode__ = __str__
+
+        def __str__(self):
+            return self._name.encode('ascii', 'backslashreplace')
+
     def _get_name(self):
         try:
             (id_name,) = self._execute('name_get', [self.id])
             name = '%s' % (id_name[1],)
         except Exception:
             name = '%s,%d' % (self._model_name, self.id)
-        self.__dict__['_name'] = name
-        return name
+        return _memoize(self, '_name', name)
 
     @property
     def _keys(self):
@@ -1356,7 +1417,7 @@ class Record(object):
         The argument `fields` accepts different kinds of values.
         See :meth:`Client.read` for details.
         """
-        if context is None and self._context:
+        if context is None:
             context = self._context
         rv = self._model.read(self.id, fields, context=context)
         if isinstance(rv, dict):
@@ -1371,6 +1432,8 @@ class Record(object):
         Return a dictionary of values.
         See :meth:`Client.perm_read` for details.
         """
+        if context is None:
+            context = self._context
         rv = self._execute('perm_read', [self.id], context=context)
         return rv[0] if rv else None
 
@@ -1380,7 +1443,7 @@ class Record(object):
         `values` is a dictionary of values.
         See :meth:`Model.create` for details.
         """
-        if context is None and self._context:
+        if context is None:
             context = self._context
         values = self._model._unbrowse_values(values)
         rv = self._execute('write', [self.id], values, context=context)
@@ -1389,7 +1452,7 @@ class Record(object):
 
     def unlink(self, context=None):
         """Delete the current :class:`Record` from the database."""
-        if context is None and self._context:
+        if context is None:
             context = self._context
         rv = self._execute('unlink', [self.id], context=context)
         self.refresh()
@@ -1401,12 +1464,12 @@ class Record(object):
         The optional argument `default` is a mapping which overrides some
         values of the new record.
         """
-        if context is None and self._context:
+        if context is None:
             context = self._context
         if default:
             default = self._model._unbrowse_values(default)
         new_id = self._execute('copy', self.id, default, context=context)
-        return Record(self._model, new_id)
+        return Record(self._model, new_id, context=context)
 
     def _send(self, signal):
         """Trigger workflow `signal` for this :class:`Record`."""
@@ -1453,17 +1516,14 @@ class Record(object):
 
         def wrapper(self, *params, **kwargs):
             """Wrapper for client.execute(%r, %r, %d, *params, **kwargs)."""
-            if context:
-                kwargs.setdefault('context', context)
+            if context is not None and 'context' not in kwargs:
+                kwargs['context'] = context
             res = self._execute(attr, [self.id], *params, **kwargs)
             self.refresh()
             if isinstance(res, list) and len(res) == 1:
                 return res[0]
             return res
-        wrapper.__name__ = attr
-        wrapper.__doc__ %= (self._model_name, attr, self.id)
-        self.__dict__[attr] = mobj = wrapper.__get__(self, type(self))
-        return mobj
+        return _memoize(self, attr, wrapper, (self._model_name, attr, self.id))
 
     def __setattr__(self, attr, value):
         if attr == '_external_id':
@@ -1514,7 +1574,7 @@ def _interact(global_vars, use_pprint=True, usage=USAGE):
         pass
     else:
         if rl.get_history_length() < 0:
-            rl.set_history_length(int(os.environ.get('HISTSIZE', 500)))
+            rl.set_history_length(int(os.getenv('HISTSIZE', 500)))
         # better append instead of replace?
         atexit.register(rl.write_history_file, HIST_FILE)
 
@@ -1536,7 +1596,7 @@ def _interact(global_vars, use_pprint=True, usage=USAGE):
     Console().interact('\033[A')
 
 
-def main():
+def main(interact=_interact):
     description = ('Inspect data on Odoo objects.  Use interactively '
                    'or query a model (-m) and pass search terms or '
                    'ids as positional parameters after the options.')
@@ -1557,7 +1617,7 @@ def main():
         '--server', default=None,
         help='full URL to the XML-RPC server (default: %s)' % DEFAULT_URL)
     parser.add_option('-d', '--db', default=DEFAULT_DB, help='database')
-    parser.add_option('-u', '--user', default=DEFAULT_USER, help='username')
+    parser.add_option('-u', '--user', default=None, help='username')
     parser.add_option(
         '-p', '--password', default=None,
         help='password, or it will be requested on login')
@@ -1586,16 +1646,19 @@ def main():
         print(USAGE)
 
     if args.env:
-        client = Client.from_config(args.env, verbose=args.verbose)
+        client = Client.from_config(args.env,
+                                    user=args.user, verbose=args.verbose)
     else:
         if not args.server:
             args.server = ['-c', args.config] if args.config else DEFAULT_URL
+        if not args.user:
+            args.user = DEFAULT_USER
         client = Client(args.server, args.db, args.user, args.password,
                         verbose=args.verbose)
+    client.context = {'lang': (os.getenv('LANG') or 'en_US').split('.')[0]}
 
     if args.model and domain and client.user:
-        context = {'lang': (os.environ.get('LANG') or 'en_US').split('.')[0]}
-        data = client.execute(args.model, 'read', domain, args.fields, context)
+        data = client.execute(args.model, 'read', domain, args.fields)
         if not args.fields:
             args.fields = ['id']
             if data:
@@ -1609,7 +1672,7 @@ def main():
         if not client.user:
             client.connect()
         # Enter interactive mode
-        _interact(global_vars)
+        return interact(global_vars) if interact else global_vars
 
 if __name__ == '__main__':
     main()

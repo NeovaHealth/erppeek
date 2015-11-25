@@ -2,10 +2,56 @@ Changelog
 ---------
 
 
-1.x (unreleased)
+1.6.2 (2015-09-17)
+~~~~~~~~~~~~~~~~~~
+
+* Add an optional ``transport`` argument to the ``Client`` constructor.
+  This is useful for tweaking the SSL context or adding an optional
+  timeout parameter.
+
+* Implement ``==`` comparison for ``RecordList`` instances.
+
+* Uninstall dependent add-ons in a single call.
+
+* Do not install/uninstall add-ons if other actions are pending.
+
+* Do not hang when the ``Client`` constructor receives invalid
+  arguments.
+
+* Fix ``str(record)`` and ``print(record)`` with non-ASCII names.
+
+
+1.6.1 (2014-11-12)
+~~~~~~~~~~~~~~~~~~
+
+* Support using ``--env`` and ``--user`` together to connect with a
+  different user.
+
+* Adapt for Odoo 8.0 after change ``cc4fba6`` on October 2014.
+
+* Do not interpret digits with leading ``0`` as octal in search domain.
+
+
+1.6 (2014-09-23)
 ~~~~~~~~~~~~~~~~
 
+* Compatible with Odoo 8.0.
+
+* New attribute ``Client.context`` to set the default context for
+  high-level ``Model`` and ``Record`` methods.
+
+* Use blocking RPC call in ``Client.create_database``.  Asynchronous
+  method is removed in Odoo.
+
+* Return the interactive namespace with ``main(interact=False)``.
+  It helps to integrate with third-party libraries, such as IPython.
+
 * Remove a duplicate ``Logged in as ...`` line in interactive mode.
+
+* Remove the ``search+name_get`` undocumented feature which has
+  wrong behavior when applied to an empty ``RecordList``.
+
+* Do not prevent login if access to ``Client.db.list()`` is denied.
 
 
 1.6b1 (2014-06-09)
